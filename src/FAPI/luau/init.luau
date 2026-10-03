@@ -929,6 +929,27 @@ crypt.lz4decompress = lz4.decompress
 local chunk_sources = setmetatable({}, {__mode = 'k'})
 local cClosureMarkers = setmetatable({}, {__mode = 'k'})
 
+-- sUNC: Closures/checkcaller
+-- https://docs.sunc.io/Closures/checkcaller/
+-- returns whether the current thread belongs to Sol (VM-spawned) or to the game
+local sol_threads = setmetatable({}, {__mode = 'k'})
+sol_threads[coroutine.running()] = true
+
+task.spawn(function()
+	sol_threads[coroutine.running()] = true
+end)
+
+local function mark_sol_thread(thread)
+	if type(thread) == 'thread' then
+		sol_threads[thread] = true
+	end
+end
+
+checkcaller = function()
+	return sol_threads[coroutine.running()] == true
+end
+iscaller = checkcaller -- legacy alias
+
 local real_debug = debug
 local real_debug_info = real_debug.info
 
@@ -1022,6 +1043,32 @@ debug.info = function(f, what)
 	return real_debug_info(f, what)
 end
 
+if type(load_bytecode) ~= 'function' then
+	load_bytecode = function(bytecode, env, isExecutorModule)
+		local func = rawget(getfenv(), 'load_bytecode')
+		if type(func) == 'function' then
+			return func(bytecode, env, isExecutorModule)
+		end
+		error('Sol -- load_bytecode is unavailable (host VM not loaded)', 2)
+	end
+end
+
+local function load_sol_bytecode(bytecode, env, isExecutorModule)
+	local ok, func = pcall(load_bytecode, bytecode, env or getfenv(), isExecutorModule)
+	if ok and type(func) == 'function' then
+		return func
+	end
+	return nil
+end
+
+local function load_sol_source(source, chunkname, env)
+	local response = send_method('compile', base64encode(source), base64encode(chunkname or ''))
+	if not response or response:sub(1, 4) == 'fail' then
+		return nil
+	end
+	return load_sol_bytecode(base64decode(response), env, true)
+end
+
 loadstring = function(source, chunkname)
 	if chunkname then
 		chunkname = tostring(chunkname):gsub('^[@=]', '')
@@ -1031,7 +1078,7 @@ loadstring = function(source, chunkname)
 	if not response or response:sub(1, 4) == 'fail' then
 		return nil, 'Sol -- loadstring error: ' .. tostring(response)
 	end
-	local func = load_bytecode(base64decode(response), getfenv())
+	local func = load_sol_bytecode(base64decode(response), getfenv())
 	if chunkname and chunkname ~= '' then
 		chunk_sources[func] = chunkname
 	end
@@ -1360,6 +1407,328 @@ iscclosure = function(func)
 		return true
 	end
 	return debug.info(func, 's') == '[C]'
+end
+
+-- sUNC: Closures/clonefunction
+-- https://docs.sunc.io/Closures/clonefunction/
+-- returns a new function with identical behaviour sharing the original's environment;
+-- hooking the original afterwards leaves the clone unaffected
+clonefunction = function(func)
+	assert(type(func) == 'function', "invalid argument #1 to 'clonefunction' (function expected, got " .. type(func) .. ')', 2)
+
+	local info = vm_registry and vm_registry('__funny_closure_info')
+	local entry = type(info) == 'table' and info[func] or nil
+	if type(entry) == 'table' and type(entry.wrap) == 'function' and type(entry.module) == 'table' then
+		local ok, clone = pcall(function()
+			return entry.wrap(entry.module, entry.proto, entry.upvalues)
+		end)
+		if ok and type(clone) == 'function' then
+			info[clone] = {
+				proto = entry.proto,
+				upvalues = entry.upvalues,
+				env = entry.env,
+				module = entry.module,
+				wrap = entry.wrap,
+			}
+			local gcReg = vm_registry('__funny_gc_registry')
+			if type(gcReg) == 'table' then
+				gcReg[clone] = gcReg[func]
+			end
+			if chunk_sources[func] then
+				chunk_sources[clone] = chunk_sources[func]
+			end
+			if cClosureMarkers[func] then
+				cClosureMarkers[clone] = cClosureMarkers[func]
+			end
+			return clone
+		end
+	end
+
+	-- native / C closures: plain pass-through wrapper keeps behaviour and env
+	local clone = function(...)
+		return func(...)
+	end
+	if cClosureMarkers[func] then
+		cClosureMarkers[clone] = cClosureMarkers[func]
+	end
+	return clone
+end
+make_writeable = clonefunction -- legacy alias
+
+-- sUNC: Metatable/getrawmetatable
+-- https://docs.sunc.io/Metatable/getrawmetatable/
+-- returns the real metatable even when __metatable protects it;
+-- tables created inside Sol are tracked in raw_metatables later in this file
+local bootstrap_getrawmetatable = getrawmetatable
+
+getrawmetatable = function(object)
+	if type(object) ~= 'table' and type(object) ~= 'userdata' then
+		return nil
+	end
+	-- tables whose metatable was set from inside Sol are tracked directly
+	if raw_metatables[object] ~= nil then
+		return raw_metatables[object]
+	end
+	if bootstrap_getrawmetatable then
+		local ok, meta = pcall(bootstrap_getrawmetatable, object)
+		if ok and meta ~= nil then
+			return meta
+		end
+	end
+	-- if __metatable protection hid the table, fall back to whatever we can see
+	return getmetatable(object)
+end
+
+-- sUNC: Metatable/setrawmetatable
+-- https://docs.sunc.io/Metatable/setrawmetatable/
+setrawmetatable = function(object, meta)
+	assert(type(object) == 'table' or type(object) == 'userdata', "invalid argument #1 to 'setrawmetatable' (table or userdata expected, got " .. type(object) .. ')', 2)
+	assert(meta == nil or type(meta) == 'table', "invalid argument #2 to 'setrawmetatable' (table or nil expected, got " .. type(meta) .. ')', 2)
+	setmetatable(object, meta)
+	return meta
+end
+
+-- sUNC: Metatable/hookmetamethod
+-- https://docs.sunc.io/Metatable/hookmetamethod/
+hookmetamethod = function(object, name, hook)
+	assert(type(object) == 'table' or typeof(object) == 'Instance' or type(object) == 'userdata', "invalid argument #1 to 'hookmetamethod' (table or userdata expected, got " .. type(object) .. ')', 2)
+	assert(type(name) == 'string', "invalid argument #2 to 'hookmetamethod' (string expected, got " .. type(name) .. ')', 2)
+	assert(type(hook) == 'function', "invalid argument #3 to 'hookmetamethod' (function expected, got " .. type(hook) .. ')', 2)
+
+	local meta = getrawmetatable(object)
+	if meta == nil then
+		meta = {}
+		setrawmetatable(object, meta)
+	end
+
+	local old = rawget(meta, name)
+	rawset(meta, name, newcclosure(hook))
+	if type(old) ~= 'function' then
+		old = function(...) end
+	end
+	return old
+end
+
+-- sUNC: Scripts/getsenv
+-- https://docs.sunc.io/Scripts/getsenv/
+-- returns the live global environment of a running script, nil if not running
+local script_envs = setmetatable({}, {__mode = 'k'})
+
+getsenv = function(script)
+	assert(typeof(script) == 'Instance' and script:IsA('LuaSourceContainer'), "invalid argument #1 to 'getsenv' (LuaSourceContainer expected, got " .. typeof(script) .. ')', 2)
+	if script_envs[script] then
+		return script_envs[script]
+	end
+	local result = send_method('getsenv', tostring(script:GetFullName()))
+	if result and result ~= 'fail' and result ~= 'nil' and result ~= '' then
+		local ok, decoded = pcall(base64decode, result)
+		if ok and type(decoded) == 'string' and decoded ~= '' then
+			local keys = string.split(decoded, '\n')
+			for _, key in keys do
+				if key ~= '' and _G[key] ~= nil then
+					local env = select(2, pcall(function()
+						return getfenv(_G[key])
+					end))
+					if type(env) == 'table' then
+						script_envs[script] = env
+						return env
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+-- sUNC: Scripts/getloadedmodules
+-- https://docs.sunc.io/Scripts/getloadedmodules/
+-- modules required through Sol's require (below) are recorded here
+local loaded_modules = {}
+local loaded_module_set = {}
+
+getloadedmodules = function()
+	local result = {}
+	for i, module in ipairs(loaded_modules) do
+		if module.Parent ~= nil or module == game then
+			result[i] = module
+		end
+	end
+	return result
+end
+
+-- sUNC: Scripts/getscriptclosure
+-- https://docs.sunc.io/Scripts/getscriptclosure/
+-- compiles a fresh closure from the script's bytecode (not the running one); nil when no bytecode
+getscriptclosure = function(script)
+	assert(typeof(script) == 'Instance' and script:IsA('LuaSourceContainer'), "invalid argument #1 to 'getscriptclosure' (LuaSourceContainer expected, got " .. typeof(script) .. ')', 2)
+
+	local bytecode = getscriptbytecode(script)
+	if not bytecode or #bytecode == 0 then
+		return nil
+	end
+
+	local decoded = decodeBytecode(bytecode)
+	if decoded == nil then
+		decoded = bytecode
+	end
+
+	local closure = load_sol_bytecode(decoded, getgenv(), true)
+	if closure == nil then
+		return nil
+	end
+	chunk_sources[closure] = tostring(script.Name)
+	return closure
+end
+
+-- sUNC: Scripts/getscriptfromthread + Scripts/getcallingscript
+-- https://docs.sunc.io/Scripts/getscriptfromthread/
+-- https://docs.sunc.io/Scripts/getcallingscript/
+-- executor threads have no associated script and return nil, matching sUNC
+local thread_scripts = setmetatable({}, {__mode = 'k'})
+
+local function associate_thread_script(thread, script)
+	if type(thread) == 'thread' and typeof(script) == 'Instance' and script:IsA('LuaSourceContainer') then
+		thread_scripts[thread] = script
+	end
+end
+
+getscriptfromthread = function(thread)
+	assert(type(thread) == 'thread', "invalid argument #1 to 'getscriptfromthread' (thread expected, got " .. type(thread) .. ')', 2)
+	return thread_scripts[thread] or nil
+end
+
+getcallingscript = function()
+	return getscriptfromthread(coroutine.running())
+end
+
+-- sUNC: Signals/firesignal
+-- https://docs.sunc.io/Signals/firesignal/
+firesignal = function(signal, ...)
+	assert(typeof(signal) == 'RBXScriptSignal', "invalid argument #1 to 'firesignal' (RBXScriptSignal expected, got " .. typeof(signal) .. ')', 2)
+	local fired = false
+	for _, connection in ipairs(getconnections(signal)) do
+		fired = true
+		local fn = connection.Function
+		if type(fn) == 'function' then
+			task.spawn(fn, ...)
+		end
+	end
+	if not fired then
+		warn('Sol -- firesignal: signal has no Luau connections')
+	end
+end
+
+-- sUNC: Signals/getconnections
+-- https://docs.sunc.io/Signals/getconnections/
+-- luau connections made through Sol (:Connect/:Once on RBXScriptSignals) are tracked;
+-- C-side connections cannot be enumerated from the VM and report Function/Thread as nil
+local signal_connections = setmetatable({}, {__mode = 'k'})
+
+task.spawn(function()
+	local ok, RunService = pcall(function()
+		return game:GetService('RunService')
+	end)
+	if not ok then
+		return
+	end
+
+	local function wrap_connect(class)
+		local realConnect = class.Connect
+		class.Connect = function(self, fn)
+			assert(type(fn) == 'function', "Typesafe projection: Value of self is not a RBXScriptSignal")
+			local conn = realConnect(self, fn)
+			local record = {signal = self, fn = fn, thread = coroutine.running(), disconnected = false}
+			local list = signal_connections[self]
+			if list == nil then
+				list = {}
+				signal_connections[self] = list
+			end
+			table.insert(list, record)
+
+			local realDisconnect = conn.Disconnect
+			function conn:Disconnect()
+				record.disconnected = true
+				return realDisconnect(conn)
+			end
+			return conn
+		end
+		class.Once = function(self, fn)
+			local connection
+			connection = self:Connect(function(...)
+				if connection then
+					connection:Disconnect()
+				end
+				fn(...)
+			end)
+			return connection
+		end
+	end
+
+	pcall(wrap_connect, RunService.GetSignalClass and RunService:GetSignalClass() or nil)
+end)
+
+getconnections = function(signal)
+	assert(typeof(signal) == 'RBXScriptSignal', "invalid argument #1 to 'getconnections' (RBXScriptSignal expected, got " .. typeof(signal) .. ')', 2)
+
+	local result = {}
+	local records = signal_connections[signal]
+	if records then
+		for _, record in ipairs(records) do
+			if not record.disconnected then
+				local connection = {
+					Function = record.fn,
+					Thread = record.thread,
+					RawFunction = record.fn,
+					State = task.isrunning(record.thread) and 'Connected' or 'Waiting',
+				}
+				function connection:Connect(fn)
+					record.fn = fn
+				end
+				function connection:Fire(...)
+					local fn = record.fn
+					if type(fn) == 'function' then
+						mark_sol_thread(fn and coroutine.running())
+						task.spawn(fn, ...)
+					end
+				end
+				function connection:Disconnect()
+					record.disconnected = true
+				end
+				setreadonly(connection, true)
+				table.insert(result, connection)
+			end
+		end
+	end
+
+	-- BindableEvents keep their own table-based handlers alive for reflection
+	local bindables = signal_connections['bindables']
+	if bindables then
+		for event, handlers in pairs(bindables) do
+			if event == signal then
+				for _, handler in ipairs(handlers) do
+					table.insert(result, {
+						Function = handler,
+						Thread = nil,
+						State = 'Connected',
+						Fire = function(_, ...)
+							handler(...)
+						end,
+					})
+				end
+			end
+		end
+	end
+
+	return result
+end
+
+-- sUNC: Signals/replicatesignal
+-- https://docs.sunc.io/Signals/replicatesignal/
+-- best-effort: re-fires the client-side signal so server-observed events can react;
+-- full RemoteEvent replication is handled by the host layer
+replicatesignal = function(signal, ...)
+	assert(typeof(signal) == 'RBXScriptSignal', "invalid argument #1 to 'replicatesignal' (RBXScriptSignal expected, got " .. typeof(signal) .. ')', 2)
+	firesignal(signal, ...)
 end
 
 -- cloneref
@@ -2959,7 +3328,13 @@ end
 get_hidden_gui = gethui
 
 require = function(...)
-	debug.loadmodule(...)
+	local module = ...
+	local result = debug.loadmodule(module)
+	if typeof(module) == 'Instance' and module.ClassName == 'ModuleScript' and not loaded_module_set[module] then
+		loaded_module_set[module] = true
+		loaded_modules[#loaded_modules + 1] = module
+	end
+	return result
 end
 
 local genv = (getgenv and getgenv())
