@@ -2978,6 +2978,10 @@ local task_defer = task.defer
 local string_match, string_find = string.match, string.find
 local table_pack, table_unpack = table.pack, table.unpack
 
+local function isa_local(inst, class)
+	return real_typeof(inst) == "Instance" and inst.IsA(inst, class)
+end
+
 local raw_metatables = real_setmetatable({}, {__mode = "k"})
 
 setmetatable = function(value, metatable)
@@ -2994,7 +2998,7 @@ local function warn_once(key, msg)
 	end
 end
 
-local function isa(inst, class) -- no NAMECALL, so user __namecall hooks never see our internals
+local function isa_local(inst, class) -- no NAMECALL, so user __namecall hooks never see our internals
 	return real_typeof(inst) == "Instance" and inst.IsA(inst, class)
 end
 
@@ -3182,6 +3186,77 @@ isfunctionhooked = function(fn)
 	local info = closure_info[fn]
 	if info then return hooked[info.proto] ~= nil end
 	return native_hooks[fn] ~= nil
+end
+
+getrawmetatable = function(obj)
+	if obj == nil then
+		error("invalid argument #1 to 'getrawmetatable' (value expected, got no value)", 2)
+	end
+	local tracked = raw_metatables[obj]
+	if tracked ~= nil then
+		return tracked
+	end
+	local ok, meta = real_pcall(real_getmetatable, obj)
+	if ok and meta ~= nil then
+		return meta
+	end
+	return nil
+end
+
+clonefunction = function(fn)
+	real_assert(real_type(fn) == "function",
+		"invalid argument #1 to 'clonefunction' (function expected, got " .. real_type(fn) .. ")", 2)
+	local info = closure_info[fn]
+	if info ~= nil and real_type(info.proto) == "table" and real_type(info.wrap) == "function" then
+		local copiedProto = {}
+		for k, v in real_pairs(info.proto) do
+			copiedProto[k] = v
+		end
+		markProto(copiedProto)
+		local clone = info.wrap(info.module, copiedProto, info.upvalues)
+		closure_info[clone] = {
+			proto = copiedProto, upvalues = info.upvalues, env = info.env, module = info.module, wrap = info.wrap,
+		}
+		gc_registry[clone] = gc_registry[fn]
+		local owner = closure_scripts[fn]
+		if owner ~= nil then
+			closure_scripts[clone] = owner
+		end
+		return clone
+	end
+
+	local clone = function(...)
+		return fn(...)
+	end
+	local owner = closure_scripts[fn]
+	if owner ~= nil then
+		closure_scripts[clone] = owner
+	end
+	return clone
+end
+
+getsenv = function(script)
+	real_assert(isa_local(script, "LuaSourceContainer"),
+		"invalid argument #1 to 'getsenv' (LuaSourceContainer expected, got " .. real_typeof(script) .. ")", 2)
+	local cached = script_environments[script]
+	if cached ~= nil then
+		return cached
+	end
+
+	local env = {}
+	local bytecode = getscriptbytecode(script)
+	if bytecode ~= nil then
+		local ok, func = real_pcall(load_bytecode, bytecode, env, false)
+		if ok and real_type(func) == "function" then
+			local info = closure_info[func]
+			if info ~= nil and real_type(info.env) == "table" then
+				env = info.env
+			end
+			script_environments[script] = env
+			closure_scripts[func] = script
+		end
+	end
+	return env
 end
 
 local function try(fn, ...)
