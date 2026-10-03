@@ -1375,7 +1375,7 @@ local function clone_target(proxy)
 	return obj
 end
 
-cloneref = function(obj)
+local cloneref = function(obj)
 	local proxy = newproxy(true)
 	local meta = getmetatable(proxy)
 	clonerefs[proxy] = obj
@@ -3182,6 +3182,10 @@ restorefunction = function(fn)
 	native_hooks[fn] = nil
 	call_hooks[fn] = nil
 	clear_import_caches()
+end
+
+restorefunc = function(fn)
+	return restorefunction(fn)
 end
 
 isfunctionhooked = function(fn)
