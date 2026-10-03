@@ -2986,16 +2986,6 @@ setmetatable = function(value, metatable)
 	return result
 end
 
-getrawmetatable = function(value)
-	local metatable = raw_metatables[value]
-	if metatable ~= nil then
-		return metatable
-	end
-	return real_getmetatable(value)
-end
-
-debug.getmetatable = getrawmetatable
-
 local warned = {}
 local function warn_once(key, msg)
 	if not warned[key] then
@@ -3085,7 +3075,7 @@ end
 local GLOBAL_NAMES = {
 	"print", "warn", "error", "assert", "pcall", "xpcall", "select", "type", "typeof", "tostring",
 	"tonumber", "rawget", "rawset", "rawequal", "rawlen", "setmetatable", "getmetatable", "next",
-	"getrawmetatable", "pairs", "ipairs", "unpack", "tick", "time", "wait", "delay", "spawn", "newproxy",
+	"pairs", "ipairs", "unpack", "tick", "time", "wait", "delay", "spawn", "newproxy",
 	"collectgarbage", "require",
 }
 local LIB_NAMES = {
