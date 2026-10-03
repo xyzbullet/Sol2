@@ -619,6 +619,21 @@ def recvMethod(method, args):
         except Exception:
             return b'fail'
 
+    elif method == 'getloadedmodules':
+        if _sdk is None:
+            return b'fail'
+        try:
+            names = []
+            for inst in _sdk.datamodel.getDescendants():
+                if inst and inst.className == 'ModuleScript':
+                    try:
+                        names.append(inst.getFullName())
+                    except Exception:
+                        continue
+            return json.dumps(names).encode('utf-8')
+        except Exception:
+            return b'fail'
+
     elif method == 'decompile':
         try:
             r = requests.post(
